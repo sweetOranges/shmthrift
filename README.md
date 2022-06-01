@@ -1,5 +1,5 @@
 # shmthrift
-用共享内存的方式来进行thrift调用
+用共享内存的方式来进行thrift调用，ipc的一种选择
 
 # 简介
 thrift支持多种transport， 我提供了一种支持oneway的shared memory transport，内部采用了一个支持变长的spmc队列， 完全基于共享内存。
