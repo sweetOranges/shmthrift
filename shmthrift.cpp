@@ -64,6 +64,7 @@ public:
                 continue;
             int64_t size = (msg - 1)->size - sizeof(spsc_var_queue_block);
             inputTransport_->resetBuffer((uint8_t *)msg, size, TMemoryBuffer::COPY);
+            spsc_var_queue_pop(q_);
             process();
         }
     }
