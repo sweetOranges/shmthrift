@@ -29,6 +29,11 @@ using namespace ::apache::thrift::transport;
 using namespace ::apache::thrift::server;
 using namespace echo;
 
+struct SHMData
+{
+    char data[4096][4096];
+};
+
 class SHMServer : public TServer
 {
 public:
@@ -56,23 +61,32 @@ public:
 
     void start()
     {
-        q_ = spsc_var_queue_init_shm(shm_path_.c_str(), size_);
+        q_ = spsc_var_queue_init_shm<SHMData>(shm_path_.c_str(), size_);
         while (true)
         {
             spsc_var_queue_block *msg = (spsc_var_queue_block *)spsc_var_queue_read(q_);
             if (msg == nullptr)
                 continue;
             int64_t size = (msg - 1)->size - sizeof(spsc_var_queue_block);
-            inputTransport_->resetBuffer((uint8_t *)msg, size, TMemoryBuffer::COPY);
+            int seqid = *((int *)msg);
+            char *data = (char *)msg + sizeof(int);
+            inputTransport_->resetBuffer((uint8_t *)data, size, TMemoryBuffer::COPY);
+            outputTransport_->resetBuffer();
+            process(seqid);
             spsc_var_queue_pop(q_);
-            process();
         }
     }
-    void process()
+    void process(int seqid)
     {
         try
         {
             processor_->process(inputProtocol_, outputProtocol_, NULL);
+            uint8_t *buf;
+            uint32_t size;
+            outputTransport_->getBuffer(&buf, &size);
+            char *output = &q_->udata.data[seqid][2];
+            memcpy(output, buf, size);
+            q_->udata.data[seqid][1] = 1;
         }
         catch (const TTransportException &ex)
         {
@@ -92,7 +106,7 @@ public:
 private:
     int64_t size_;
     std::string shm_path_;
-    spsc_var_queue *q_;
+    spsc_var_queue<SHMData> *q_;
     boost::shared_ptr<TNullTransport> nullTransport_;
 
     boost::shared_ptr<TMemoryBuffer> inputTransport_;
@@ -112,9 +126,11 @@ class SHMTransport : public TVirtualTransport<SHMTransport>
 public:
     SHMTransport(const std::string &path)
     {
-        q_ = spsc_var_queue_connect_shm(path.c_str());
+        q_ = spsc_var_queue_connect_shm<SHMData>(path.c_str());
         buffer_ = new char[1024];
-        offset_ = 0;
+        woffset_ = 0;
+        roffset_ = 0;
+        free_index_ = -1;
     }
     virtual ~SHMTransport() {}
 
@@ -122,21 +138,36 @@ public:
 
     bool isOpen() const { return true; }
 
-    bool peek() override { return true; }
+    bool peek()
+    {
+        return true;
+    }
 
     void close() override {}
 
     uint32_t read(uint8_t *buf, uint32_t len)
     {
-        return 1;
+        while (q_->udata.data[free_index_][1] == 0)
+        {
+        }
+        char *data = &q_->udata.data[free_index_][2] + roffset_;
+        memcpy(buf, data, len);
+        roffset_ += len;
+        return len;
     }
-
-    uint32_t readEnd() {}
+    uint32_t readEnd()
+    {
+        spsc_var_queue_spin_lock(q_);
+        q_->udata.data[free_index_][0] = 0;
+        spsc_var_queue_spin_unlock(q_);
+        roffset_ = 0;
+        return 0;
+    }
 
     void write(const uint8_t *buf, uint32_t len)
     {
-        memcpy(buffer_ + offset_, buf, len);
-        offset_ += len;
+        memcpy(buffer_ + woffset_, buf, len);
+        woffset_ += len;
     }
     uint32_t writeEnd()
     {
@@ -145,11 +176,17 @@ public:
 
     void flush()
     {
-
-        char *des = (char *)spsc_var_queue_alloc(q_, offset_);
-        memcpy(des, buffer_, offset_);
-        spsc_var_queue_push(q_);
-        offset_ = 0;
+        spsc_var_queue_spin_lock(q_);
+        free_index_ = get_free_index();
+        q_->udata.data[free_index_][0] = 1; // lock
+        q_->udata.data[free_index_][1] = 0; // not finished
+        int alloc_size = woffset_ + sizeof(int);
+        char *des = (char *)spsc_var_queue_alloc<SHMData>(q_, alloc_size);
+        memcpy(des, &free_index_, sizeof(int));
+        memcpy(des + sizeof(int), buffer_, woffset_);
+        spsc_var_queue_push<SHMData>(q_);
+        woffset_ = 0;
+        spsc_var_queue_spin_unlock(q_);
     };
 
     const std::string getOrigin() const
@@ -158,9 +195,29 @@ public:
     }
 
 private:
+    int get_free_index()
+    {
+        int index = -1;
+        do
+        {
+            for (int i = 0; i < sizeof(SHMData::data[0]); i++)
+            {
+                if (q_->udata.data[i][0] == 0)
+                {
+                    index = i;
+                    break;
+                }
+            }
+        } while (index == -1);
+        return index;
+    }
+
+private:
     char *buffer_;
-    int offset_;
-    spsc_var_queue *q_;
+    int woffset_;
+    int roffset_;
+    int free_index_;
+    spsc_var_queue<SHMData> *q_;
 };
 class EchoHandler : virtual public EchoIf
 {
@@ -169,8 +226,10 @@ public:
     {
     }
 
-    void echo(const std::string &s)
+    void echo(std::string &_return, const std::string &arg)
     {
+        _return = arg;
+        std::cout << "eeeeee\t" << arg << "\n";
     }
     void test(const int32_t time)
     {
@@ -219,12 +278,16 @@ int main(int argc, char **argv)
         boost::shared_ptr<TProtocol> protocol(new TBinaryProtocol(socket));
         EchoClient *client = new EchoClient(protocol);
         socket->open();
-        struct timeval tv;
+        struct timeval tv, tv2;
         while (true)
         {
-            sleep(1);
+            // sleep(1);
             gettimeofday(&tv, NULL);
-            client->test(tv.tv_usec);
+            std::string _arg;
+            client->echo(_arg, "test");
+            gettimeofday(&tv2, NULL);
+            std::cout << "echo  " << _arg << "\t" << tv2.tv_usec - tv.tv_usec << "\n";
+            // client->test(tv.tv_usec);
         }
     }
 }
